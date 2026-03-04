@@ -1,0 +1,25 @@
+Package: polyfreq
+Type: Package
+Title: Fast De Silva Allele Frequency Estimation for Polyploids
+Version: 0.1.0
+Authors@R:
+    person("Author", "Name", email = "author@example.com", role = c("aut", "cre"))
+Description: Provides an optimized pure-R implementation of the de Silva et al.
+    (2005) EM algorithm for estimating allele frequencies in polyploid populations
+    under polysomic inheritance with a mixed mating system (selfing + random
+    mating). All subroutines previously compiled in C/C++ within the 'polysat'
+    package are re-implemented using vectorized R operations and sparse-matrix
+    algebra. Uses the 'genambig' class and accessor functions from 'polysat'.
+    Reference: De Silva HN, Hall AJ, Rikkerink E, McNeilage MA, Fraser LG (2005)
+    <doi:10.1038/sj.hdy.6800728>.
+License: GPL-2
+Encoding: UTF-8
+RoxygenNote: 7.3.2
+Depends:
+    R (>= 4.0.0)
+Imports:
+    cli,
+    Matrix,
+    polysat
+Suggests:
+    testthat (>= 3.0.0)

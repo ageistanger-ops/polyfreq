@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(unzip -o \"C:/Users/User/Documents/ZueF/Hainbuche_oktoploid/code_information/oktoploid_analysis/polyfreq_material/R.zip\" -d /tmp/polysat_R/)",
+      "Bash(unzip -o \"C:/Users/User/Documents/ZueF/Hainbuche_oktoploid/code_information/oktoploid_analysis/polyfreq_material/src.zip\" -d /tmp/polysat_src/)"
+    ]
+  }
+}
