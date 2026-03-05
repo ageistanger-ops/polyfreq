@@ -38,8 +38,7 @@
 #'
 #' @export
 G_r <- function(q, n) {
-  # TODO: implement
-  stop("G_r: not yet implemented")
+  as.integer(choose(n + q, q + 1L))
 }
 
 
@@ -72,8 +71,20 @@ G_r <- function(q, n) {
 #'
 #' @export
 INDEXG_r <- function(ag1, na1, m2) {
-  # TODO: implement
-  stop("INDEXG_r: not yet implemented")
+  # C++ ag1[m2-1] -> R ag1[m2], C++ ag1[m2-2] -> R ag1[m2-1]
+  x <- 1L + ag1[m2] - ag1[m2 - 1L]
+
+  if (m2 >= 3L) {
+    for (q in 1L:(m2 - 2L)) {
+      # C++ ag1[m2-q-2] -> R ag1[m2-q-1], C++ ag1[m2-q-1] -> R ag1[m2-q]
+      x <- x + G_r(q, na1 + 1L - ag1[m2 - q - 1L]) -
+               G_r(q, na1 + 1L - ag1[m2 - q])
+    }
+  }
+
+  # C++ ag1[0] -> R ag1[1]
+  x <- x + G_r(m2 - 1L, na1) - G_r(m2 - 1L, na1 + 1L - ag1[1L])
+  as.integer(x)
 }
 
 
@@ -110,8 +121,26 @@ INDEXG_r <- function(ag1, na1, m2) {
 #'
 #' @export
 GENLIST_r <- function(ng, na1, m2) {
-  # TODO: implement
-  stop("GENLIST_r: not yet implemented")
+  ag  <- matrix(0L, nrow = ng, ncol = m2)
+  ag1 <- rep(1L, m2)
+  ag[1L, ] <- ag1
+
+  g <- 1L
+  a <- m2                       # 1-based (rightmost column)
+  while (a > 0L) {
+    if (ag1[a] == na1) {
+      a <- a - 1L
+    } else {
+      ag1[a] <- ag1[a] + 1L
+      if (a < m2) {
+        ag1[(a + 1L):m2] <- ag1[a]
+      }
+      g <- g + 1L
+      ag[g, ] <- ag1
+      a <- m2
+    }
+  }
+  ag
 }
 
 
@@ -149,8 +178,16 @@ GENLIST_r <- function(ng, na1, m2) {
 #'
 #' @export
 RANMUL_r <- function(ng, na1, ag, m2) {
-  # TODO: implement
-  stop("RANMUL_r: not yet implemented")
+  # arep: count of each allele in each genotype via tabulate
+  arep <- t(apply(ag, 1L, tabulate, nbins = na1))
+  storage.mode(arep) <- "integer"
+
+  # rmul: multinomial coefficient = m2! / prod(count_a!)
+  rmul <- as.integer(round(exp(
+    lfactorial(m2) - rowSums(lfactorial(arep))
+  )))
+
+  list(rmul = rmul, arep = arep)
 }
 
 
@@ -182,6 +219,50 @@ RANMUL_r <- function(ng, na1, ag, m2) {
 #'
 #' @export
 SELFMAT_r <- function(ng, na1, ag, m2) {
-  # TODO: implement
-  stop("SELFMAT_r: not yet implemented")
+  m    <- m2 %/% 2L
+  smat <- matrix(0L, nrow = ng, ncol = ng)
+
+  # Pre-compute all gamete position combinations (m positions from 1:m2)
+  gam_pos <- combn(m2, m)          # m x n_gam matrix
+  n_gam   <- ncol(gam_pos)
+
+  # Pre-compute constant for batch INDEXG
+  G_top <- as.integer(choose(na1 + m2 - 1L, m2))  # G_r(m2-1, na1)
+
+  # Expand gamete pair indices (all n_gam^2 ordered pairs)
+  idx1 <- rep(seq_len(n_gam), each  = n_gam)
+  idx2 <- rep(seq_len(n_gam), times = n_gam)
+
+  for (g in seq_len(ng)) {
+    parent <- ag[g, ]
+
+    # Extract alleles for each gamete: m x n_gam matrix
+    gam_alleles <- matrix(parent[gam_pos], nrow = m, ncol = n_gam)
+
+    # Build all offspring: concatenate gamete pairs, then sort each row
+    # off is n_gam^2 x m2
+    off <- cbind(
+      t(gam_alleles[, idx1, drop = FALSE]),
+      t(gam_alleles[, idx2, drop = FALSE])
+    )
+    off <- t(apply(off, 1L, sort.int, method = "radix"))
+
+    # Batch INDEXG: vectorized over all offspring rows
+    x <- 1L + off[, m2] - off[, m2 - 1L]
+    if (m2 >= 3L) {
+      for (q in 1L:(m2 - 2L)) {
+        x <- x +
+          as.integer(choose(na1 + 1L - off[, m2 - q - 1L] + q, q + 1L)) -
+          as.integer(choose(na1 + 1L - off[, m2 - q]     + q, q + 1L))
+      }
+    }
+    x <- x + G_top -
+      as.integer(choose(na1 + 1L - off[, 1L] + m2 - 1L, m2))
+
+    # Accumulate offspring counts into smat row
+    smat[g, ] <- tabulate(x, nbins = ng)
+  }
+
+  storage.mode(smat) <- "integer"
+  smat
 }
