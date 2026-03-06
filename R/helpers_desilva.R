@@ -266,3 +266,174 @@ SELFMAT_r <- function(ng, na1, ag, m2) {
   storage.mode(smat) <- "integer"
   smat
 }
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers for the sparse code path (not exported)
+# ---------------------------------------------------------------------------
+
+# .merge_sorted_pairs -------------------------------------------------------
+# Vectorised merge of two sorted m-column integer matrices into a sorted
+# 2m-column integer matrix.  Processes N rows simultaneously in 2m passes.
+#
+# Arguments:
+#   g1  integer matrix (N x m)  left sorted halves
+#   g2  integer matrix (N x m)  right sorted halves
+#   m   integer                 half-ploidy (m2 / 2)
+#
+# Returns an integer matrix (N x 2m) whose rows are the row-wise merges of
+# the sorted halves g1 and g2.
+.merge_sorted_pairs <- function(g1, g2, m) {
+  n   <- nrow(g1)
+  m2  <- 2L * m
+
+  # Append a sentinel column so matrix indexing never goes out of bounds
+  sentinel <- rep(.Machine$integer.max, n)
+  g1 <- cbind(g1, sentinel)
+  g2 <- cbind(g2, sentinel)
+
+  result <- matrix(0L, nrow = n, ncol = m2)
+  ia     <- rep(1L, n)
+  ib     <- rep(1L, n)
+  rows   <- seq_len(n)
+
+  for (k in seq_len(m2)) {
+    a_val  <- g1[cbind(rows, ia)]
+    b_val  <- g2[cbind(rows, ib)]
+    take_a <- a_val <= b_val
+    result[, k] <- ifelse(take_a, a_val, b_val)
+    ia <- ia + take_a
+    ib <- ib + 1L - take_a
+  }
+  result
+}
+
+
+# .selfmat_cone_batch -------------------------------------------------------
+# Builds a sparse selfing matrix for a set of cone genotypes using batch-
+# vectorised processing.  Replaces the slow per-parent R loop in SELFMAT_r
+# with fully vectorised gamete extraction + merge-sort + hash lookup.
+#
+# The returned matrix M satisfies M[i, j] = number of gamete-pair combinations
+# of parent i that produce offspring j.  Divide by smatdiv in the caller to
+# convert to proportions (same convention as SELFMAT_r).
+#
+# Arguments:
+#   ag_cone    integer matrix (n_cone x m2) — cone genotypes
+#   na1        integer                       — allele count incl. null
+#   m2         integer                       — ploidy (must be even)
+#   chunk_size integer                       — parents per batch (default 200)
+#
+# Returns a Matrix::sparseMatrix of class "dgCMatrix" (n_cone x n_cone).
+.selfmat_cone_batch <- function(ag_cone, na1, m2,
+                                chunk_size = 200L) {
+  n_cone <- nrow(ag_cone)
+  m      <- m2 %/% 2L
+
+  # --- Pre-compute once ---------------------------------------------------
+
+  # Gamete position combinations: each column of gam_pos selects m positions
+  # from 1:m2 that make up one gamete.  n_gam = C(m2, m) = 70 for octoploid.
+  gam_pos <- combn(m2, m)          # m x n_gam
+  n_gam   <- ncol(gam_pos)
+  n_pairs <- n_gam * n_gam        # all ordered gamete pairs
+
+  # Indices for all n_gam^2 gamete pair combinations
+  idx1 <- rep(seq_len(n_gam), each  = n_gam)   # first  gamete index
+  idx2 <- rep(seq_len(n_gam), times = n_gam)   # second gamete index
+
+  # Polynomial hash weights: must be > na1 to avoid collisions
+  # Use double arithmetic to avoid integer overflow for large na1
+  hash_weights <- as.numeric(na1)^(seq(0L, m2 - 1L))
+
+  # Hash for every cone genotype row
+  cone_hashes <- as.numeric(ag_cone %*% hash_weights)
+
+  # --- Accumulate sparse triplets -----------------------------------------
+  # Collect per-chunk into lists (avoids O(total_nnz^2) from growing vectors).
+  n_chunks  <- ceiling(n_cone / chunk_size)
+  si_chunks <- vector("list", n_chunks)
+  sj_chunks <- vector("list", n_chunks)
+  sx_chunks <- vector("list", n_chunks)
+  chunk_k   <- 1L
+
+  for (chunk_start in seq(1L, n_cone, by = chunk_size)) {
+    chunk_end <- min(chunk_start + chunk_size - 1L, n_cone)
+    B         <- chunk_end - chunk_start + 1L   # actual chunk size
+
+    batch <- ag_cone[chunk_start:chunk_end, , drop = FALSE]   # B x m2
+
+    # ---- Step 1: build gamete matrix (B*n_gam) x m ---
+    # For each of the B parents, compute all n_gam gametes; stack vertically.
+    parent_idx <- rep(seq_len(B), each  = n_gam)   # which parent (1..B)
+    gam_col_j  <- rep(seq_len(n_gam), times = B)   # which gamete (1..n_gam)
+
+    # gamete_mat[r, k] = allele at position gam_pos[k, gam_col_j[r]] of parent r
+    gamete_mat <- matrix(0L, nrow = B * n_gam, ncol = m)
+    for (k in seq_len(m)) {
+      gamete_mat[, k] <- batch[cbind(parent_idx,
+                                     gam_pos[k, gam_col_j])]
+    }
+
+    # ---- Step 2: build offspring pairs (B*n_pairs) x m each ---
+    # For each parent b and each ordered pair (idx1[p], idx2[p]):
+    #   gamete rows for parent b live at (b-1)*n_gam + 1:n_gam
+    base_offset <- rep((seq_len(B) - 1L) * n_gam, each = n_pairs)
+    g1_rows     <- base_offset + rep(idx1, times = B)
+    g2_rows     <- base_offset + rep(idx2, times = B)
+
+    g1 <- gamete_mat[g1_rows, , drop = FALSE]   # (B*n_pairs) x m
+    g2 <- gamete_mat[g2_rows, , drop = FALSE]   # (B*n_pairs) x m
+
+    # ---- Step 3: merge-sort each offspring row ---
+    off <- .merge_sorted_pairs(g1, g2, m)        # (B*n_pairs) x m2
+
+    # ---- Step 4: hash offspring and look up cone membership ---
+    off_hash <- as.numeric(off %*% hash_weights)
+    j_local  <- match(off_hash, cone_hashes)     # NA if not in cone
+
+    # ---- Step 5 (fully vectorised): per-parent count → sparse triplets ---
+    # Replace the B-iteration inner loop with a single order() + rle() over
+    # all valid offspring in the chunk.  This eliminates ~200 R-level function
+    # calls per chunk (48 K total) and removes within-chunk c() growth.
+    #
+    # Encoding: pair_key = global_par * (n_cone + 1) + j_valid.
+    # Values fit exactly in double (max ≈ 48400 * 48401 < 2.34e9 < 2^53). ✓
+    # Sorted order groups by global_par first, then by j_valid within parent,
+    # so rle() on pair_key gives (parent, offspring) pairs with counts.
+    valid_mask <- !is.na(j_local)
+    if (any(valid_mask)) {
+      j_valid    <- j_local[valid_mask]
+      par_local  <- rep(seq_len(B), each = n_pairs)[valid_mask]   # 1..B
+      global_par <- chunk_start - 1L + par_local
+
+      ord      <- order(global_par, j_valid)
+      par_ord  <- global_par[ord]
+      j_ord    <- j_valid[ord]
+      pair_key <- as.numeric(par_ord) * as.numeric(n_cone + 1L) + j_ord
+      rl       <- rle(pair_key)
+
+      si_c <- as.integer(rl$values %/% as.numeric(n_cone + 1L))
+      sj_c <- as.integer(rl$values %%  as.numeric(n_cone + 1L))
+      sx_c <- as.numeric(rl$lengths)
+    } else {
+      si_c <- integer(0)
+      sj_c <- integer(0)
+      sx_c <- numeric(0)
+    }
+
+    si_chunks[[chunk_k]] <- si_c
+    sj_chunks[[chunk_k]] <- sj_c
+    sx_chunks[[chunk_k]] <- sx_c
+    chunk_k <- chunk_k + 1L
+  }
+
+  si <- unlist(si_chunks, use.names = FALSE)
+  sj <- unlist(sj_chunks, use.names = FALSE)
+  sx <- unlist(sx_chunks, use.names = FALSE)
+
+  Matrix::sparseMatrix(i    = si,
+                       j    = sj,
+                       x    = sx,
+                       dims = c(n_cone, n_cone))
+}
