@@ -336,11 +336,16 @@ SELFMAT_r <- function(ng, na1, ag, m2) {
   # from 1:m2 that make up one gamete.  n_gam = C(m2, m) = 70 for octoploid.
   gam_pos <- combn(m2, m)          # m x n_gam
   n_gam   <- ncol(gam_pos)
-  n_pairs <- n_gam * n_gam        # all ordered gamete pairs
-
-  # Indices for all n_gam^2 gamete pair combinations
-  idx1 <- rep(seq_len(n_gam), each  = n_gam)   # first  gamete index
-  idx2 <- rep(seq_len(n_gam), times = n_gam)   # second gamete index
+  # Unordered gamete pairs: sorted_merge(g_a, g_b) = sorted_merge(g_b, g_a),
+  # so (i,j) and (j,i) give identical offspring.  Use only i<=j pairs:
+  #   - homogametic  (i == i): n_gam pairs,       weight 1
+  #   - heterogametic (i < j): C(n_gam,2) pairs,  weight 2
+  # Reduces from n_gam^2 = 4900 to C(n_gam+1, 2) = 2485 pairs for octoploid.
+  het_pairs <- combn(n_gam, 2L)                  # 2 x C(n_gam, 2)
+  idx1    <- c(seq_len(n_gam), het_pairs[1L, ])  # n_pairs total
+  idx2    <- c(seq_len(n_gam), het_pairs[2L, ])
+  pair_wt <- c(rep(1L, n_gam), rep(2L, ncol(het_pairs)))
+  n_pairs <- length(idx1)                         # C(n_gam+1, 2) = 2485
 
   # Polynomial hash weights: must be > na1 to avoid collisions
   # Use double arithmetic to avoid integer overflow for large na1
@@ -392,7 +397,10 @@ SELFMAT_r <- function(ng, na1, ag, m2) {
     off_hash <- as.numeric(off %*% hash_weights)
     j_local  <- match(off_hash, cone_hashes)     # NA if not in cone
 
-    # ---- Step 5 (fully vectorised): per-parent count → sparse triplets ---
+    # Pair weights for this chunk (1 = homogametic, 2 = heterogametic)
+    wt_local <- rep(pair_wt, times = B)
+
+    # ---- Step 5 (fully vectorised): per-parent weighted count → sparse triplets ---
     # Replace the B-iteration inner loop with a single order() + rle() over
     # all valid offspring in the chunk.  This eliminates ~200 R-level function
     # calls per chunk (48 K total) and removes within-chunk c() growth.
@@ -404,18 +412,23 @@ SELFMAT_r <- function(ng, na1, ag, m2) {
     valid_mask <- !is.na(j_local)
     if (any(valid_mask)) {
       j_valid    <- j_local[valid_mask]
+      wt_valid   <- wt_local[valid_mask]
       par_local  <- rep(seq_len(B), each = n_pairs)[valid_mask]   # 1..B
       global_par <- chunk_start - 1L + par_local
 
       ord      <- order(global_par, j_valid)
       par_ord  <- global_par[ord]
       j_ord    <- j_valid[ord]
+      wt_ord   <- as.numeric(wt_valid[ord])
       pair_key <- as.numeric(par_ord) * as.numeric(n_cone + 1L) + j_ord
       rl       <- rle(pair_key)
 
+      # Sum weights per (parent, offspring) run using cumulative sum trick
+      cum_wt   <- cumsum(wt_ord)
+      sx_c     <- diff(c(0.0, cum_wt[cumsum(rl$lengths)]))
+
       si_c <- as.integer(rl$values %/% as.numeric(n_cone + 1L))
       sj_c <- as.integer(rl$values %%  as.numeric(n_cone + 1L))
-      sx_c <- as.numeric(rl$lengths)
     } else {
       si_c <- integer(0)
       sj_c <- integer(0)
