@@ -13,7 +13,8 @@ de_silva_freq_EM(
   initFreq = simpleFreq(object[samples, loci]),
   tol = 1e-08,
   maxiter = 10000,
-  method = c("auto", "dense", "sparse")
+  method = c("auto", "dense", "sparse"),
+  nthreads = 1L
 )
 }
 \arguments{
@@ -45,6 +46,13 @@ column.  Defaults to \code{polysat::simpleFreq(object[samples, loci])}.}
 switches to the sparse path when \code{ng > 50000}, \code{"dense"}
 always uses the dense path (may fail for large \code{ng}), \code{"sparse"}
 always uses the sparse path.}
+
+\item{nthreads}{Integer; number of parallel workers for the locus x
+population loop (default \code{1L} = sequential).  Values \code{> 1}
+require the \pkg{future} and \pkg{future.apply} packages.  When
+\code{nthreads > 1}, the Rcpp sparse selfmat uses 1 OpenMP thread per
+worker to avoid CPU over-subscription; when \code{nthreads == 1}, the
+Rcpp selfmat uses all available cores via OpenMP.}
 }
 \value{
 A data frame with one row per population and one column per allele

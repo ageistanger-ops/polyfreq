@@ -19,7 +19,12 @@ Depends:
     R (>= 4.0.0)
 Imports:
     cli,
+    future,
+    future.apply,
     Matrix,
-    polysat
+    polysat,
+    Rcpp
+LinkingTo:
+    Rcpp
 Suggests:
     testthat (>= 3.0.0)

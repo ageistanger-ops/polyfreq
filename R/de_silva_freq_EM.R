@@ -9,6 +9,7 @@
 #   .convmat       — builds phenotype-to-genotype conversion matrix C (dense path)
 #   .build_cone    — builds union phenotype cone (sparse path)
 #   .neumann_gprob — Neumann series solver for (I - s*smatt)^{-1} * rvec
+#   .one_locus_pop — computes EM for a single (locus, population) pair
 #
 # Reference: De Silva HN, Hall AJ, Rikkerink E, McNeilage MA, Fraser LG (2005)
 #   Estimation of allele frequencies in polyploids under certain patterns of
@@ -74,6 +75,12 @@
 #'   switches to the sparse path when \code{ng > 50000}, \code{"dense"}
 #'   always uses the dense path (may fail for large \code{ng}), \code{"sparse"}
 #'   always uses the sparse path.
+#' @param nthreads Integer; number of parallel workers for the locus x
+#'   population loop (default \code{1L} = sequential).  Values \code{> 1}
+#'   require the \pkg{future} and \pkg{future.apply} packages.  When
+#'   \code{nthreads > 1}, the Rcpp sparse selfmat uses 1 OpenMP thread per
+#'   worker to avoid CPU over-subscription; when \code{nthreads == 1}, the
+#'   Rcpp selfmat uses all available cores via OpenMP.
 #'
 #' @return A data frame with one row per population and one column per allele
 #'   (named \code{"Locus.allele"}) plus one null column per locus (named
@@ -94,6 +101,8 @@
 #'   isMissing simpleFreq genbinary.to.genambig
 #' @importFrom Matrix Matrix solve sparseMatrix
 #' @importFrom cli cli_abort cli_alert_info cli_alert_success
+#' @importFrom future plan multisession sequential
+#' @importFrom future.apply future_lapply
 #'
 #' @examples
 #' \dontrun{
@@ -112,9 +121,11 @@ de_silva_freq_EM <- function(object, self,
                              initFreq = simpleFreq(object[samples, loci]),
                              tol      = 1e-8,
                              maxiter  = 1e4,
-                             method   = c("auto", "dense", "sparse")) {
+                             method   = c("auto", "dense", "sparse"),
+                             nthreads = 1L) {
 
-  method <- match.arg(method)
+  method   <- match.arg(method)
+  nthreads <- as.integer(nthreads)
 
   # --- Input validation (matching polysat::deSilvaFreq) ----------------------
 
@@ -171,243 +182,330 @@ de_silva_freq_EM <- function(object, self,
   # Create indexf closure
   indexf <- .make_indexf(m2)
 
-  # --- Main loop: per locus, per population ----------------------------------
+  # --- Build task list: one entry per (locus, population) pair ---------------
 
-  for (L in loci) {
+  locus_pop_df <- expand.grid(L = loci, pop = pops, stringsAsFactors = FALSE)
+  tasks        <- split(locus_pop_df, seq_len(nrow(locus_pop_df)))
 
-    for (pop in pops) {
+  # Shared read-only arguments passed to every worker
+  shared <- list(
+    object   = object,
+    self     = self,
+    initFreq = initFreq,
+    initNull = initNull,
+    tol      = tol,
+    maxiter  = maxiter,
+    method   = method,
+    m2       = m2,
+    smatdiv  = smatdiv,
+    samples  = samples
+  )
 
-      # Samples in this population with non-missing data at this locus
-      psamples <- Samples(object, populations = pop)[
-        !isMissing(object, Samples(object, populations = pop), L)
-      ]
-      psamples <- psamples[psamples %in% samples]
+  # Number of OpenMP threads for the Rcpp selfmat within each worker:
+  # - nthreads==1: give all cores to OpenMP (one R process using all CPUs)
+  # - nthreads>1 : each worker uses 1 thread (avoid CPU over-subscription)
+  cpp_threads <- if (nthreads == 1L) parallel::detectCores() else 1L
 
-      # Extract initial allele frequencies for this locus-population
-      subInitFreq <- initFreq[pop, grep(paste("^", L, "\\.", sep = ""),
-                                        names(initFreq))]
+  # --- Dispatch ---------------------------------------------------------------
 
-      # Identify alleles with non-zero initial frequency
-      templist <- names(subInitFreq)[subInitFreq != 0]
-      templist <- strsplit(templist, split = ".", fixed = TRUE)
-      alleles  <- vapply(templist, function(x) as.integer(x[2L]), integer(1L))
-      alleles  <- sort(alleles)
-      na  <- length(alleles)
-      na1 <- na + 1L
+  worker_fn <- function(pair) {
+    do.call(polyfreq:::.one_locus_pop,
+            c(pair,
+              shared,
+              list(quiet       = nthreads > 1L,
+                   cpp_threads = cpp_threads)))
+  }
 
-      # Number of genotypes: choose(na1 + m2 - 1, m2)
-      ng <- as.numeric(choose(na1 + m2 - 1L, m2))
+  if (nthreads == 1L) {
+    # Sequential — identical to old double-loop behaviour
+    results <- lapply(tasks, function(pair) {
+      do.call(.one_locus_pop,
+              c(pair,
+                shared,
+                list(quiet       = FALSE,
+                     cpp_threads = cpp_threads)))
+    })
+  } else {
+    future::plan(future::multisession, workers = nthreads)
+    on.exit(future::plan(future::sequential), add = TRUE)
+    results <- future.apply::future_lapply(
+      tasks,
+      worker_fn,
+      future.packages = "polyfreq",
+      future.seed     = TRUE
+    )
+  }
 
-      # Decide which code path to use
-      use_sparse <- switch(method,
-        "dense"  = FALSE,
-        "sparse" = TRUE,
-        "auto"   = (ng > 50000)
-      )
+  # --- Assemble results into finalfreq ----------------------------------------
 
-      # Initial allele frequencies
-      p1      <- rep(0, na1)
-      p1[na1] <- initNull[L]
-      subInitFreq <- subInitFreq * (1 - initNull[L]) / sum(subInitFreq)
-      for (a in alleles) {
-        p1[match(a, alleles)] <- subInitFreq[1L, paste(L, a, sep = ".")]
-      }
+  for (res in results) {
+    pop     <- res$pop
+    L       <- res$L
+    p2      <- res$p2
+    alleles <- res$alleles
+    na1     <- res$na1
 
-      if (!use_sparse) {
-        # ==================================================================
-        # DENSE PATH — bit-identical to polysat::deSilvaFreq
-        # ==================================================================
-
-        ng_int <- as.integer(ng)
-
-        # Precompute structures
-        ag   <- GENLIST_r(ng_int, na1, m2)
-        temp <- .fenlist(na, m2)
-        af   <- temp[[1L]]
-        naf  <- temp[[2L]]
-        nf   <- length(naf)
-        temp <- RANMUL_r(ng_int, na1, ag, m2)
-        rmul <- temp$rmul
-        arep <- temp$arep
-        smatt <- SELFMAT_r(ng_int, na1, ag, m2) / smatdiv
-        cmat  <- .convmat(ng_int, nf, na1, ag, indexf)
-
-        # Observed phenotype frequencies
-        pp <- rep(0, nf)
-        for (s in psamples) {
-          phenotype <- sort(unique(Genotype(object, s, L)))
-          phenotype <- match(phenotype, alleles)
-          f <- indexf(length(phenotype), phenotype, na)
-          pp[f] <- pp[f] + 1
-        }
-        pp <- pp / sum(pp)
-
-        # --- EM algorithm --------------------------------------------------
-
-        converge <- 0L
-        niter    <- 1L
-        rmul_d   <- as.numeric(rmul)
-        arep_t   <- t(arep)                     # na1 x ng (pre-transpose)
-
-        # Pre-compute (I - s*A)^{-1} — constant across iterations
-        s3_inv <- solve(diag(nrow = ng_int) - self * smatt)
-
-        while (converge == 0L) {
-
-          # E-step: expected genotype frequencies
-          pa      <- as.numeric(p1)
-          pa[na1] <- 1 - sum(pa[seq_len(na)])
-
-          pa_mat <- matrix(pa[ag], nrow = ng_int, ncol = m2)
-          log_pa <- log(pa_mat)
-          log_pa[!is.finite(log_pa)] <- -744
-          rvec <- rmul_d * exp(rowSums(log_pa))
-
-          gprob <- (1 - self) * (s3_inv %*% rvec)
-
-          # Eq. (12): distribute genotype probs across phenotypes
-          xx1      <- t(t(cmat) * as.numeric(gprob))
-          xx2      <- rowSums(xx1)
-          xx2_inv  <- ifelse(xx2 > 0, 1 / xx2, 0)
-          xx3      <- xx1 * xx2_inv
-          EP       <- crossprod(xx3, pp)
-
-          # M-step: update allele frequencies
-          p2 <- as.numeric(arep_t %*% EP) / m2
-
-          # Convergence check
-          pB   <- p1 + p2
-          pT   <- p1 - p2
-          keep <- abs(pB) > 1e-14
-          pT   <- pT[keep]
-          pB   <- pB[keep]
-
-          if (length(pB) == 0L || sum(abs(pT) / pB) <= tol) {
-            converge <- 1L
-          }
-          if (niter >= maxiter) {
-            converge <- 1L
-          }
-
-          niter <- niter + 1L
-          p1 <- p2
-        }
-
-      } else {
-        # ==================================================================
-        # SPARSE PATH — union phenotype cone + Neumann series
-        # ==================================================================
-
-        cli_alert_info(
-          "[{L} / {pop}] sparse path  (ng_full = {format(ng, big.mark=',', scientific=FALSE)})"
-        )
-
-        # --- Build phenotype cone ------------------------------------------
-        cone        <- .build_cone(psamples, object, L, alleles, na, na1,
-                                   m2, indexf)
-        ag_c        <- cone$ag_cone
-        n_c         <- cone$n_cone
-        cph         <- cone$compact_ph_idx   # compact phenotype index (1..n_uph)
-        unique_ph   <- cone$unique_ph        # original indexf value per compact group
-        n_uph       <- cone$n_uph            # number of unique phenotypes in cone
-
-        cli_alert_info(
-          "  Cone: {n_c} genotypes, {n_uph} phenotypes  (vs {format(ng, big.mark=',', scientific=FALSE)} full ng)"
-        )
-
-        # Precompute RANMUL on cone genotypes
-        temp   <- RANMUL_r(n_c, na1, ag_c, m2)
-        rmul_c <- as.numeric(temp$rmul)
-        arep_c <- temp$arep
-
-        # Build sparse selfing matrix on cone (one-time cost)
-        cli_alert_info("  Building sparse selfing matrix ...")
-        smatt_c <- .selfmat_cone_batch(ag_c, na1, m2) / smatdiv
-
-        # Observed phenotype frequencies — compact vector of length n_uph.
-        # unique_ph[j] is the raw indexf value for compact group j.
-        # We build a small lookup: raw indexf → compact index.
-        ph_to_compact <- function(f) match(f, unique_ph)
-
-        pp_compact <- numeric(n_uph)
-        for (s in psamples) {
-          phenotype <- sort(unique(Genotype(object, s, L)))
-          phenotype <- match(phenotype, alleles)
-          f         <- indexf(length(phenotype), phenotype, na)
-          j         <- ph_to_compact(f)
-          if (!is.na(j)) pp_compact[j] <- pp_compact[j] + 1L
-        }
-        pp_compact <- pp_compact / sum(pp_compact)
-
-        cli_alert_info("  Starting EM ...")
-
-        # --- EM algorithm (sparse) -----------------------------------------
-
-        converge  <- 0L
-        niter     <- 1L
-        arep_c_t  <- t(arep_c)          # na1 x n_c (pre-transpose)
-
-        while (converge == 0L) {
-
-          # E-step: random-mating genotype frequencies
-          pa      <- as.numeric(p1)
-          pa[na1] <- 1 - sum(pa[seq_len(na)])
-
-          pa_mat <- matrix(pa[ag_c], nrow = n_c, ncol = m2)
-          log_pa <- log(pa_mat)
-          log_pa[!is.finite(log_pa)] <- -744
-          rvec <- rmul_c * exp(rowSums(log_pa))
-
-          # Selfing equilibrium via Neumann series
-          gprob <- .neumann_gprob(smatt_c, rvec, self)
-
-          # Distribute genotype probs across compact phenotype groups.
-          # xx2_compact[j] = sum of gprob for cone genotypes in compact group j.
-          # rowsum groups rows of a 1-col matrix by cph, giving an n_uph-row result.
-          xx2_compact <- as.numeric(
-            rowsum(matrix(gprob, ncol = 1L), cph, reorder = TRUE)
-          )
-          xx2 <- xx2_compact[cph]    # expand back to length n_c
-
-          # Expected genotype counts
-          EP <- gprob * pp_compact[cph] / xx2
-          EP[!is.finite(EP)] <- 0
-
-          # M-step: update allele frequencies
-          p2 <- as.numeric(arep_c_t %*% EP) / m2
-
-          # Convergence check
-          pB   <- p1 + p2
-          pT   <- p1 - p2
-          keep <- abs(pB) > 1e-14
-          pT   <- pT[keep]
-          pB   <- pB[keep]
-
-          if (length(pB) == 0L || sum(abs(pT) / pB) <= tol) {
-            converge <- 1L
-          }
-          if (niter >= maxiter) {
-            converge <- 1L
-          }
-
-          niter <- niter + 1L
-          p1 <- p2
-        }
-
-        cli_alert_success("  {niter - 1L} EM iterations")
-      }
-
-      # Write final frequencies to output (same for both paths)
-      for (a in alleles) {
-        finalfreq[pop, match(paste(L, a, sep = "."), names(finalfreq))] <-
-          p2[match(a, alleles)]
-      }
-      finalfreq[pop, match(paste(L, "null", sep = "."), names(finalfreq))] <-
-        p2[na1]
+    for (a in alleles) {
+      finalfreq[pop, match(paste(L, a, sep = "."), names(finalfreq))] <-
+        p2[match(a, alleles)]
     }
+    finalfreq[pop, match(paste(L, "null", sep = "."), names(finalfreq))] <-
+      p2[na1]
   }
 
   finalfreq
+}
+
+
+# ---------------------------------------------------------------------------
+# .one_locus_pop
+# ---------------------------------------------------------------------------
+# Internal worker: runs the EM algorithm for a single (locus, population)
+# pair.  Called sequentially or in parallel via future_lapply.
+#
+# Arguments:
+#   L, pop      character   locus name and population name
+#   object      genambig    the full dataset (read-only)
+#   self        numeric     selfing rate
+#   initFreq    data.frame  initial allele frequencies (from simpleFreq)
+#   initNull    named num   initial null frequency per locus
+#   tol         numeric     convergence tolerance
+#   maxiter     integer     max EM iterations
+#   method      character   "auto" | "dense" | "sparse"
+#   m2          integer     ploidy
+#   smatdiv     integer     selfing matrix divisor (choose(m2,m)^2)
+#   samples     character   sample names in scope
+#   quiet       logical     suppress cli progress messages (TRUE in workers)
+#   cpp_threads integer     OpenMP threads for Rcpp selfmat
+#
+# Returns a named list: list(L, pop, p2, alleles, na1)
+.one_locus_pop <- function(L, pop, object, self, initFreq, initNull,
+                            tol, maxiter, method, m2, smatdiv, samples,
+                            quiet = FALSE, cpp_threads = 1L) {
+
+  m      <- m2 %/% 2L
+  indexf <- .make_indexf(m2)
+
+  # Samples in this population with non-missing data at this locus
+  psamples <- Samples(object, populations = pop)[
+    !isMissing(object, Samples(object, populations = pop), L)
+  ]
+  psamples <- psamples[psamples %in% samples]
+
+  # Extract initial allele frequencies for this locus-population
+  subInitFreq <- initFreq[pop, grep(paste("^", L, "\\.", sep = ""),
+                                    names(initFreq))]
+
+  # Identify alleles with non-zero initial frequency
+  templist <- names(subInitFreq)[subInitFreq != 0]
+  templist <- strsplit(templist, split = ".", fixed = TRUE)
+  alleles  <- vapply(templist, function(x) as.integer(x[2L]), integer(1L))
+  alleles  <- sort(alleles)
+  na  <- length(alleles)
+  na1 <- na + 1L
+
+  # Number of genotypes: choose(na1 + m2 - 1, m2)
+  ng <- as.numeric(choose(na1 + m2 - 1L, m2))
+
+  # Decide which code path to use
+  use_sparse <- switch(method,
+    "dense"  = FALSE,
+    "sparse" = TRUE,
+    "auto"   = (ng > 50000)
+  )
+
+  # Initial allele frequencies
+  p1      <- rep(0, na1)
+  p1[na1] <- initNull[L]
+  subInitFreq <- subInitFreq * (1 - initNull[L]) / sum(subInitFreq)
+  for (a in alleles) {
+    p1[match(a, alleles)] <- subInitFreq[1L, paste(L, a, sep = ".")]
+  }
+
+  if (!use_sparse) {
+    # ========================================================================
+    # DENSE PATH — bit-identical to polysat::deSilvaFreq
+    # ========================================================================
+
+    ng_int <- as.integer(ng)
+
+    # Precompute structures
+    ag   <- GENLIST_r(ng_int, na1, m2)
+    temp <- .fenlist(na, m2)
+    af   <- temp[[1L]]
+    naf  <- temp[[2L]]
+    nf   <- length(naf)
+    temp <- RANMUL_r(ng_int, na1, ag, m2)
+    rmul <- temp$rmul
+    arep <- temp$arep
+    smatt <- SELFMAT_r(ng_int, na1, ag, m2) / smatdiv
+    cmat  <- .convmat(ng_int, nf, na1, ag, indexf)
+
+    # Observed phenotype frequencies
+    pp <- rep(0, nf)
+    for (s in psamples) {
+      phenotype <- sort(unique(Genotype(object, s, L)))
+      phenotype <- match(phenotype, alleles)
+      f <- indexf(length(phenotype), phenotype, na)
+      pp[f] <- pp[f] + 1
+    }
+    pp <- pp / sum(pp)
+
+    # --- EM algorithm --------------------------------------------------
+
+    converge <- 0L
+    niter    <- 1L
+    rmul_d   <- as.numeric(rmul)
+    arep_t   <- t(arep)                     # na1 x ng (pre-transpose)
+
+    # Pre-compute (I - s*A)^{-1} — constant across iterations
+    s3_inv <- solve(diag(nrow = ng_int) - self * smatt)
+
+    while (converge == 0L) {
+
+      # E-step: expected genotype frequencies
+      pa      <- as.numeric(p1)
+      pa[na1] <- 1 - sum(pa[seq_len(na)])
+
+      pa_mat <- matrix(pa[ag], nrow = ng_int, ncol = m2)
+      log_pa <- log(pa_mat)
+      log_pa[!is.finite(log_pa)] <- -744
+      rvec <- rmul_d * exp(rowSums(log_pa))
+
+      gprob <- (1 - self) * (s3_inv %*% rvec)
+
+      # Eq. (12): distribute genotype probs across phenotypes
+      xx1      <- t(t(cmat) * as.numeric(gprob))
+      xx2      <- rowSums(xx1)
+      xx2_inv  <- ifelse(xx2 > 0, 1 / xx2, 0)
+      xx3      <- xx1 * xx2_inv
+      EP       <- crossprod(xx3, pp)
+
+      # M-step: update allele frequencies
+      p2 <- as.numeric(arep_t %*% EP) / m2
+
+      # Convergence check
+      pB   <- p1 + p2
+      pT   <- p1 - p2
+      keep <- abs(pB) > 1e-14
+      pT   <- pT[keep]
+      pB   <- pB[keep]
+
+      if (length(pB) == 0L || sum(abs(pT) / pB) <= tol) {
+        converge <- 1L
+      }
+      if (niter >= maxiter) {
+        converge <- 1L
+      }
+
+      niter <- niter + 1L
+      p1 <- p2
+    }
+
+  } else {
+    # ========================================================================
+    # SPARSE PATH — union phenotype cone + Neumann series
+    # ========================================================================
+
+    if (!quiet)
+      cli_alert_info(
+        "[{L} / {pop}] sparse path  (ng_full = {format(ng, big.mark=',', scientific=FALSE)})"
+      )
+
+    # --- Build phenotype cone ------------------------------------------
+    cone        <- .build_cone(psamples, object, L, alleles, na, na1,
+                               m2, indexf)
+    ag_c        <- cone$ag_cone
+    n_c         <- cone$n_cone
+    cph         <- cone$compact_ph_idx   # compact phenotype index (1..n_uph)
+    unique_ph   <- cone$unique_ph        # original indexf value per compact group
+    n_uph       <- cone$n_uph            # number of unique phenotypes in cone
+
+    if (!quiet)
+      cli_alert_info(
+        "  Cone: {n_c} genotypes, {n_uph} phenotypes  (vs {format(ng, big.mark=',', scientific=FALSE)} full ng)"
+      )
+
+    # Precompute RANMUL on cone genotypes
+    temp   <- RANMUL_r(n_c, na1, ag_c, m2)
+    rmul_c <- as.numeric(temp$rmul)
+    arep_c <- temp$arep
+
+    # Build sparse selfing matrix on cone (one-time cost)
+    if (!quiet) cli_alert_info("  Building sparse selfing matrix ...")
+    smatt_c <- .selfmat_cone_batch(ag_c, na1, m2,
+                                   nthreads = cpp_threads) / smatdiv
+
+    # Observed phenotype frequencies — compact vector of length n_uph.
+    ph_to_compact <- function(f) match(f, unique_ph)
+
+    pp_compact <- numeric(n_uph)
+    for (s in psamples) {
+      phenotype <- sort(unique(Genotype(object, s, L)))
+      phenotype <- match(phenotype, alleles)
+      f         <- indexf(length(phenotype), phenotype, na)
+      j         <- ph_to_compact(f)
+      if (!is.na(j)) pp_compact[j] <- pp_compact[j] + 1L
+    }
+    pp_compact <- pp_compact / sum(pp_compact)
+
+    if (!quiet) cli_alert_info("  Starting EM ...")
+
+    # --- EM algorithm (sparse) -----------------------------------------
+
+    converge  <- 0L
+    niter     <- 1L
+    arep_c_t  <- t(arep_c)          # na1 x n_c (pre-transpose)
+
+    while (converge == 0L) {
+
+      # E-step: random-mating genotype frequencies
+      pa      <- as.numeric(p1)
+      pa[na1] <- 1 - sum(pa[seq_len(na)])
+
+      pa_mat <- matrix(pa[ag_c], nrow = n_c, ncol = m2)
+      log_pa <- log(pa_mat)
+      log_pa[!is.finite(log_pa)] <- -744
+      rvec <- rmul_c * exp(rowSums(log_pa))
+
+      # Selfing equilibrium via Neumann series
+      gprob <- .neumann_gprob(smatt_c, rvec, self)
+
+      # Distribute genotype probs across compact phenotype groups.
+      xx2_compact <- as.numeric(
+        rowsum(matrix(gprob, ncol = 1L), cph, reorder = TRUE)
+      )
+      xx2 <- xx2_compact[cph]    # expand back to length n_c
+
+      # Expected genotype counts
+      EP <- gprob * pp_compact[cph] / xx2
+      EP[!is.finite(EP)] <- 0
+
+      # M-step: update allele frequencies
+      p2 <- as.numeric(arep_c_t %*% EP) / m2
+
+      # Convergence check
+      pB   <- p1 + p2
+      pT   <- p1 - p2
+      keep <- abs(pB) > 1e-14
+      pT   <- pT[keep]
+      pB   <- pB[keep]
+
+      if (length(pB) == 0L || sum(abs(pT) / pB) <= tol) {
+        converge <- 1L
+      }
+      if (niter >= maxiter) {
+        converge <- 1L
+      }
+
+      niter <- niter + 1L
+      p1 <- p2
+    }
+
+    if (!quiet) cli_alert_success("  {niter - 1L} EM iterations")
+  }
+
+  list(L = L, pop = pop, p2 = p2, alleles = alleles, na1 = na1)
 }
 
 
