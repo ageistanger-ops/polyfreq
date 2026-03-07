@@ -1,0 +1,14 @@
+# Compiled R package artifacts
+src/*.o
+src/*.dll
+src/*.so
+src/*.a
+
+# R session artifacts
+.Rhistory
+.RData
+.Ruserdata
+
+# OS
+Thumbs.db
+.DS_Store
