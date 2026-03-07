@@ -266,3 +266,69 @@ SELFMAT_r <- function(ng, na1, ag, m2) {
   storage.mode(smat) <- "integer"
   smat
 }
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers for the sparse code path (not exported)
+# ---------------------------------------------------------------------------
+
+# .selfmat_cone_batch -------------------------------------------------------
+# Builds a sparse selfing matrix for a set of cone genotypes.
+#
+# Thin R wrapper: pre-computes gamete positions + unordered pair indices +
+# hash vectors in R, then delegates the heavy inner loops (gamete extraction,
+# inline merge-sort, hash lookup, triplet accumulation) to the compiled
+# C++ function .selfmat_cone_cpp() in src/selfmat_cone.cpp.
+#
+# The returned matrix M satisfies M[i, j] = number of gamete-pair combinations
+# of parent i that produce offspring j.  Divide by smatdiv in the caller to
+# convert to proportions (same convention as SELFMAT_r).
+#
+# Arguments:
+#   ag_cone    integer matrix (n_cone x m2) — cone genotypes (1-based pos)
+#   na1        integer                       — allele count incl. null
+#   m2         integer                       — ploidy (must be even)
+#   chunk_size integer                       — parents per C++ chunk (default 200)
+#   nthreads   integer                       — OpenMP threads in C++ (default 1)
+#
+# Returns a Matrix::sparseMatrix of class "dgCMatrix" (n_cone x n_cone).
+.selfmat_cone_batch <- function(ag_cone, na1, m2,
+                                chunk_size = 200L,
+                                nthreads   = 1L) {
+  m     <- m2 %/% 2L
+  n_cone <- nrow(ag_cone)
+
+  # Gamete position combinations (1-based column indices into ag_cone rows).
+  # Each column of gam_pos selects m positions → one gamete.
+  # n_gam = C(m2, m) = 70 for octoploid.
+  gam_pos <- combn(m2, m)          # m x n_gam, values 1..m2
+  n_gam   <- ncol(gam_pos)
+
+  # Unordered gamete pairs (0-based): sorted_merge(g_a, g_b) = sorted_merge(g_b, g_a),
+  # so (i,j) and (j,i) produce identical offspring.  Use only i<=j pairs:
+  #   - homogametic  (i == i): n_gam pairs,       weight 1
+  #   - heterogametic (i < j): C(n_gam,2) pairs,  weight 2
+  # Reduces from n_gam^2 = 4900 to C(n_gam+1, 2) = 2485 pairs for octoploid.
+  het_pairs <- combn(n_gam, 2L)                       # 2 x C(n_gam, 2)
+  idx1    <- c(seq_len(n_gam) - 1L, het_pairs[1L, ] - 1L)  # 0-based
+  idx2    <- c(seq_len(n_gam) - 1L, het_pairs[2L, ] - 1L)
+  pair_wt <- c(rep(1L, n_gam), rep(2L, ncol(het_pairs)))
+
+  # Polynomial hash weights: base > na1 avoids collisions.
+  hash_weights <- as.numeric(na1)^(seq(0L, m2 - 1L))
+
+  # Hash for every cone genotype row (used by C++ for lookup table).
+  cone_hashes  <- as.numeric(ag_cone %*% hash_weights)
+
+  # Delegate heavy computation to C++
+  result <- .selfmat_cone_cpp(ag_cone, gam_pos,
+                               idx1, idx2, pair_wt,
+                               hash_weights, cone_hashes,
+                               m, as.integer(chunk_size),
+                               as.integer(nthreads))
+
+  Matrix::sparseMatrix(i    = result$i,
+                       j    = result$j,
+                       x    = result$x,
+                       dims = c(n_cone, n_cone))
+}
