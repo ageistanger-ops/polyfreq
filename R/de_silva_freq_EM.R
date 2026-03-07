@@ -201,10 +201,13 @@ de_silva_freq_EM <- function(object, self,
     samples  = samples
   )
 
-  # Number of OpenMP threads for the Rcpp selfmat within each worker:
-  # - nthreads==1: give all cores to OpenMP (one R process using all CPUs)
-  # - nthreads>1 : each worker uses 1 thread (avoid CPU over-subscription)
-  cpp_threads <- if (nthreads == 1L) parallel::detectCores() else 1L
+  # Number of OpenMP threads for the Rcpp selfmat within each worker.
+  # Partition cores proportionally so that (nthreads R workers) ×
+  # (cpp_threads OpenMP threads) ≈ total physical cores.
+  # nthreads=1  → all cores to OpenMP (e.g. 12 threads on a 12-core machine)
+  # nthreads=4  → 3 OpenMP threads per worker  (12 / 4)
+  # nthreads=12 → 1 OpenMP thread per worker   (12 / 12)
+  cpp_threads <- max(1L, parallel::detectCores() %/% nthreads)
 
   # --- Dispatch ---------------------------------------------------------------
 
@@ -686,8 +689,10 @@ de_silva_freq_EM <- function(object, self,
 .build_cone <- function(psamples, object, L, alleles, na, na1, m2, indexf) {
 
   # --- Collect unique observed phenotypes -----------------------------------
-  # Each entry of unique_phenos is a sorted vector of positions in alleles[]
-  # (values in 1..na, no null).
+  # Each entry of unique_phenos is a sorted integer vector of positions in
+  # alleles[] (values 1..na, no null).
+  # polysat::Genotype() uses S4 dispatch and CANNOT be called from C++,
+  # so this loop stays in R.
   pheno_seen <- list()
   for (s in psamples) {
     raw       <- sort(unique(Genotype(object, s, L)))
@@ -699,94 +704,30 @@ de_silva_freq_EM <- function(object, self,
   }
   unique_phenos <- unname(pheno_seen)
 
-  # Polynomial hash weights for row deduplication.
-  # Using double arithmetic: base (na1 + 1) avoids collisions across alleles.
-  hash_base    <- as.numeric(na1 + 1L)
-  hash_weights <- hash_base^(seq(0L, m2 - 1L))
+  # --- C++: GENLIST per phenotype + dedup + INDEXF + compact mapping --------
+  # .build_cone_cpp() (src/build_cone.cpp) handles:
+  #   1. GENLIST enumeration of m2-multisets for each phenotype closure
+  #   2. Global deduplication by polynomial hash
+  #   3. INDEXF computation for every unique cone genotype
+  #   4. Compact phenotype mapping (sort/unique/match)
+  result <- .build_cone_cpp(unique_phenos, na, na1, m2)
 
-  # --- Enumerate all genotypes in each phenotype's closure ------------------
-  # For phenotype P = {a1..ak}, its closure is all m2-multisets from
-  # {a1..ak, null} = GENLIST_r with local_na1 = k + 1 alleles.
-  # Map local allele indices back to global values before collecting.
+  ag_cone <- result$ag_cone
+  n_cone  <- nrow(ag_cone)
 
-  all_rows <- vector("list", length(unique_phenos))
-
-  for (pi in seq_along(unique_phenos)) {
-    pheno     <- unique_phenos[[pi]]    # positions in alleles[], length k
-    k         <- length(pheno)
-    local_na1 <- k + 1L
-    local_ng  <- as.integer(choose(local_na1 + m2 - 1L, m2))
-    local_ag  <- GENLIST_r(local_ng, local_na1, m2)
-
-    # Mapping: local index 1..k → position pheno[1..k] in alleles[]; local k+1 → na1.
-    # We store POSITIONS (1..na1) in the cone matrix, NOT raw allele values.
-    # This is required so that pa[ag_cone[g, k]] correctly indexes the na1-element
-    # probability vector in the EM loop.
-    local_to_global_idx <- c(pheno, na1)   # length local_na1; values in 1..na1
-
-    # Apply mapping column-wise (fully vectorised)
-    global_ag <- matrix(local_to_global_idx[local_ag], nrow = local_ng, ncol = m2)
-    storage.mode(global_ag) <- "integer"
-
-    all_rows[[pi]] <- global_ag
-  }
-
-  # --- Deduplicate ----------------------------------------------------------
-  ag_all     <- do.call(rbind, all_rows)
-  row_hashes <- as.numeric(ag_all %*% hash_weights)
-  keep       <- !duplicated(row_hashes)
-  ag_cone    <- ag_all[keep, , drop = FALSE]
-  storage.mode(ag_cone) <- "integer"
-  n_cone      <- nrow(ag_cone)
-  cone_hashes <- row_hashes[keep]
-
-  # --- Compute phenotype index for each cone genotype -----------------------
-  # Uses the same indexf closure as the main function, operating on positions
-  # in alleles[] (1..na), not raw allele values.
-  # NOTE: raw indexf values can be up to sum(C(na,0:m2)) which may be millions.
-  # We return COMPACT indices (1..n_uph) to avoid large vector allocations.
-  raw_pheno_lookup <- integer(n_cone)
-  af1_buf          <- integer(m2)
-
-  for (g in seq_len(n_cone)) {
-    ag1 <- ag_cone[g, ]   # values are positions 1..na1 (na1 = null sentinel)
-
-    if (ag1[1L] == na1) {
-      naf1 <- 0L
-    } else {
-      naf1          <- 1L
-      af1_buf[naf1] <- ag1[1L]         # position in alleles[] (1..na)
-      for (col in 2L:m2) {
-        if (ag1[col] == na1) break
-        if (ag1[col] > af1_buf[naf1]) {
-          naf1          <- naf1 + 1L
-          af1_buf[naf1] <- ag1[col]
-        }
-      }
-    }
-    if (naf1 < m2) af1_buf[(naf1 + 1L):m2] <- 0L
-
-    # af1_buf already holds positions in alleles[] (1..na) — no match() needed.
-    if (naf1 > 0L) {
-      af1_pos <- af1_buf[seq_len(naf1)]
-    } else {
-      af1_pos <- integer(0L)
-    }
-
-    raw_pheno_lookup[g] <- indexf(naf1, af1_pos, na)
-  }
-
-  # Build compact phenotype mapping: raw indexf values → 1..n_uph
-  unique_ph      <- sort(unique(raw_pheno_lookup))   # at most ~100 values
-  n_uph          <- length(unique_ph)
-  compact_ph_idx <- match(raw_pheno_lookup, unique_ph)  # 1..n_uph per genotype
+  # Recompute hash weights and cone hashes with base=na1 (NOT na1+1) to
+  # match the convention used by .selfmat_cone_batch() / .selfmat_cone_cpp().
+  # These are not consumed by .one_locus_pop() itself but are kept in the
+  # return value for interface consistency.
+  hash_weights <- as.numeric(na1)^(seq(0L, m2 - 1L))
+  cone_hashes  <- as.numeric(ag_cone %*% hash_weights)
 
   list(
     ag_cone        = ag_cone,
     n_cone         = n_cone,
-    compact_ph_idx = compact_ph_idx,
-    unique_ph      = unique_ph,
-    n_uph          = n_uph,
+    compact_ph_idx = result$compact_ph_idx,
+    unique_ph      = result$unique_ph,
+    n_uph          = length(result$unique_ph),
     cone_hashes    = cone_hashes,
     hash_weights   = hash_weights
   )

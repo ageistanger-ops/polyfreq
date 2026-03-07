@@ -10,6 +10,20 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
+// build_cone_cpp
+List build_cone_cpp(List unique_phenos, int na, int na1, int m2);
+RcppExport SEXP _polyfreq_build_cone_cpp(SEXP unique_phenosSEXP, SEXP naSEXP, SEXP na1SEXP, SEXP m2SEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< List >::type unique_phenos(unique_phenosSEXP);
+    Rcpp::traits::input_parameter< int >::type na(naSEXP);
+    Rcpp::traits::input_parameter< int >::type na1(na1SEXP);
+    Rcpp::traits::input_parameter< int >::type m2(m2SEXP);
+    rcpp_result_gen = Rcpp::wrap(build_cone_cpp(unique_phenos, na, na1, m2));
+    return rcpp_result_gen;
+END_RCPP
+}
 // selfmat_cone_cpp
 List selfmat_cone_cpp(IntegerMatrix ag_cone, IntegerMatrix gam_pos, IntegerVector idx1, IntegerVector idx2, IntegerVector pair_wt, NumericVector hash_weights, NumericVector cone_hashes, int m, int chunk_size, int nthreads);
 RcppExport SEXP _polyfreq_selfmat_cone_cpp(SEXP ag_coneSEXP, SEXP gam_posSEXP, SEXP idx1SEXP, SEXP idx2SEXP, SEXP pair_wtSEXP, SEXP hash_weightsSEXP, SEXP cone_hashesSEXP, SEXP mSEXP, SEXP chunk_sizeSEXP, SEXP nthreadsSEXP) {
@@ -32,6 +46,7 @@ END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_polyfreq_build_cone_cpp", (DL_FUNC) &_polyfreq_build_cone_cpp, 4},
     {"_polyfreq_selfmat_cone_cpp", (DL_FUNC) &_polyfreq_selfmat_cone_cpp, 10},
     {NULL, NULL, 0}
 };
