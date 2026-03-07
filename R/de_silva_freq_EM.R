@@ -325,6 +325,14 @@ de_silva_freq_EM <- function(object, self,
     p1[match(a, alleles)] <- subInitFreq[1L, paste(L, a, sep = ".")]
   }
 
+  # --- Progress: start -------------------------------------------------------
+  if (!quiet) {
+    path_label <- if (use_sparse) "sparse" else "dense "
+    cli_alert_info(
+      "[{L} / {pop}]  {path_label} path  (ng = {format(ng, big.mark = ',', scientific = FALSE)})"
+    )
+  }
+
   if (!use_sparse) {
     # ========================================================================
     # DENSE PATH — bit-identical to polysat::deSilvaFreq
@@ -410,11 +418,6 @@ de_silva_freq_EM <- function(object, self,
     # SPARSE PATH — union phenotype cone + Neumann series
     # ========================================================================
 
-    if (!quiet)
-      cli_alert_info(
-        "[{L} / {pop}] sparse path  (ng_full = {format(ng, big.mark=',', scientific=FALSE)})"
-      )
-
     # --- Build phenotype cone ------------------------------------------
     cone        <- .build_cone(psamples, object, L, alleles, na, na1,
                                m2, indexf)
@@ -426,7 +429,7 @@ de_silva_freq_EM <- function(object, self,
 
     if (!quiet)
       cli_alert_info(
-        "  Cone: {n_c} genotypes, {n_uph} phenotypes  (vs {format(ng, big.mark=',', scientific=FALSE)} full ng)"
+        "  cone: {format(n_c, big.mark = ',')} genotypes, {n_uph} phenotypes"
       )
 
     # Precompute RANMUL on cone genotypes
@@ -435,7 +438,6 @@ de_silva_freq_EM <- function(object, self,
     arep_c <- temp$arep
 
     # Build sparse selfing matrix on cone (one-time cost)
-    if (!quiet) cli_alert_info("  Building sparse selfing matrix ...")
     smatt_c <- .selfmat_cone_batch(ag_c, na1, m2,
                                    nthreads = cpp_threads) / smatdiv
 
@@ -451,8 +453,6 @@ de_silva_freq_EM <- function(object, self,
       if (!is.na(j)) pp_compact[j] <- pp_compact[j] + 1L
     }
     pp_compact <- pp_compact / sum(pp_compact)
-
-    if (!quiet) cli_alert_info("  Starting EM ...")
 
     # --- EM algorithm (sparse) -----------------------------------------
 
@@ -505,8 +505,11 @@ de_silva_freq_EM <- function(object, self,
       p1 <- p2
     }
 
-    if (!quiet) cli_alert_success("  {niter - 1L} EM iterations")
   }
+
+  # --- Progress: done --------------------------------------------------------
+  if (!quiet)
+    cli_alert_success("[{L} / {pop}]  {niter - 1L} iterations")
 
   list(L = L, pop = pop, p2 = p2, alleles = alleles, na1 = na1)
 }
